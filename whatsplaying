@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+"""Read-only audio detective for PipeWire. Requires pw-dump and Python 3."""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def clean(value):
+    """Keep application-supplied titles on one safe terminal line."""
+    return " ".join("".join(c if c.isprintable() else " " for c in str(value)).split())
+
+
+def describe(snapshot):
+    nodes = {}
+    forward, backward = {}, {}
+    for obj in snapshot:
+        info = obj.get("info", {})
+        if obj.get("type") == "PipeWire:Interface:Node":
+            nodes[obj["id"]] = info
+        elif obj.get("type") == "PipeWire:Interface:Link":
+            source, target = info.get("output-node-id"), info.get("input-node-id")
+            forward.setdefault(source, set()).add(target)
+            backward.setdefault(target, set()).add(source)
+
+    def name(info):
+        props = info.get("props", {})
+        return clean(props.get("node.description") or props.get("device.description")
+                     or props.get("node.nick") or props.get("node.name") or "Unknown device")
+
+    def routes(start, graph, endpoint_class):
+        pending = list(graph.get(start, ()))
+        seen, found = {start}, set()
+        while pending:
+            node_id = pending.pop()
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            info = nodes.get(node_id, {})
+            if info.get("props", {}).get("media.class") == endpoint_class:
+                found.add(name(info))
+            else:
+                pending.extend(graph.get(node_id, ()))
+        return sorted(found)
+
+    streams, bluetooth = [], []
+    for node_id, info in nodes.items():
+        props = info.get("props", {})
+        media_class = props.get("media.class")
+        if media_class == "Audio/Sink" and (props.get("device.api") == "bluez5"
+                                               or props.get("device.bus") == "bluetooth"):
+            bluetooth.append({"device": name(info), "state": info.get("state", "unknown"),
+                              "profile": clean(props.get("api.bluez5.profile", "unknown"))})
+        if media_class not in ("Stream/Output/Audio", "Stream/Input/Audio"):
+            continue
+        recording = media_class == "Stream/Input/Audio"
+        params = info.get("params", {}).get("Props", [])
+        muted = any(p.get("mute", False) for p in params)
+        volumes = [v for p in params for v in p.get("channelVolumes", [])]
+        streams.append({
+            "direction": "capture" if recording else "playback",
+            "application": clean(props.get("application.name") or props.get("application.process.binary")
+                                 or props.get("node.name") or "Unknown app"),
+            "pid": props.get("application.process.id"),
+            "title": clean(props.get("media.title") or props.get("media.name") or ""),
+            "state": info.get("state", "unknown"),
+            "muted": muted,
+            "zero_volume": bool(volumes) and all(v == 0 for v in volumes),
+            "devices": routes(node_id, backward if recording else forward,
+                              "Audio/Source" if recording else "Audio/Sink"),
+        })
+    streams.sort(key=lambda s: (s["direction"], s["state"] != "running", s["application"]))
+    return {"streams": streams, "bluetooth_outputs": bluetooth}
+
+
+def render(report):
+    lines = []
+    for direction, heading in (("playback", "Playback"), ("capture", "Microphone / audio capture")):
+        lines.append(heading)
+        streams = [s for s in report["streams"] if s["direction"] == direction]
+        if not streams:
+            lines.append("  No application streams.")
+        for stream in streams:
+            labels = [stream["state"]]
+            if stream["muted"]:
+                labels.append("muted")
+            if stream["zero_volume"]:
+                labels.append("volume 0")
+            pid = f" (PID {stream['pid']})" if stream["pid"] is not None else ""
+            lines.append(f"  [{', '.join(labels)}] {stream['application']}{pid}")
+            if stream["title"] and stream["title"] not in (stream["application"], "playback", "capture"):
+                lines.append(f"    {stream['title']}")
+            arrow = "from" if direction == "capture" else "to"
+            lines.append(f"    {arrow}: {', '.join(stream['devices']) or 'no direct device route found'}")
+        lines.append("")
+    if report["bluetooth_outputs"]:
+        lines.append("Bluetooth outputs")
+        for device in report["bluetooth_outputs"]:
+            lines.append(f"  {device['device']}: {device['state']} ({device['profile']})")
+        lines.append("")
+    lines.append("Running = processing audio; it may be silent. Idle = open but not processing.")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Show which apps are using audio, their media titles, and device routes.",
+                                     epilog="Read-only. Requires PipeWire's pw-dump. Refresh with: watch -n 1 whatsplaying")
+    parser.add_argument("--json", action="store_true", help="print a machine-readable report")
+    args = parser.parse_args()
+    try:
+        result = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=10, check=True)
+        report = describe(json.loads(result.stdout))
+    except FileNotFoundError:
+        print("whatsplaying: pw-dump is missing; install your distribution's PipeWire tools.", file=sys.stderr)
+        return 1
+    except (subprocess.SubprocessError, ValueError) as error:
+        detail = clean(getattr(error, "stderr", "") or error)
+        print(f"whatsplaying: could not read the PipeWire session: {detail}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=2) if args.json else render(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
